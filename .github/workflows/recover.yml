@@ -1,0 +1,144 @@
+name: Recover approved cloud release
+on:
+  workflow_dispatch:
+    inputs:
+      previous_run_id:
+        description: Exact failed public release/recovery run ID
+        type: string
+        required: true
+      recovery_artifact_id:
+        description: Exact encrypted recovery artifact ID from that run
+        type: string
+        required: true
+      notary_submission_id:
+        description: Only for unknown-ID recovery after inspecting Apple submission history
+        type: string
+        required: false
+      confirm_submission_sha256:
+        description: Exact submitted DMG SHA-256 when manually binding an unknown ID
+        type: string
+        required: false
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+jobs:
+  gate:
+    if: github.repository == 'AonBit/ETCPRO6-Release' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require completed repository bootstrap
+        env:
+          ENABLED: ${{ vars.CLOUD_RELEASE_ENABLED }}
+        run: test "$ENABLED" = true
+  recover-candidate:
+    needs: gate
+    environment: production-candidate
+    runs-on: xcode-27
+    timeout-minutes: 60
+    outputs:
+      receipt_id: ${{ steps.receipt.outputs.artifact-id }}
+    env:
+      UPDATE_PUBLIC_BASE_URL: ${{ vars.UPDATE_PUBLIC_BASE_URL }}
+      UPDATE_ADMIN_BASE_URL: ${{ vars.UPDATE_ADMIN_BASE_URL }}
+      STAGING_UPDATE_PUBLIC_BASE_URL: ${{ vars.STAGING_UPDATE_PUBLIC_BASE_URL }}
+      STAGING_UPDATE_ADMIN_BASE_URL: ${{ vars.STAGING_UPDATE_ADMIN_BASE_URL }}
+      ETCPRO6_UPDATE_PUBLIC_KEY: ${{ vars.ETCPRO6_UPDATE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: sudo xcode-select --switch /Applications/Xcode_27.2.app/Contents/Developer
+      - name: Verify exact failed trusted workflow and recovery artifact
+        run: node orchestration/verify-recovery.mjs verify "$RUNNER_TEMP/verified-recovery.json"
+        env:
+          GH_RECOVERY_TOKEN: ${{ github.token }}
+          RECOVERY_REPOSITORY: AonBit/ETCPRO6-Release
+          RECOVERY_RUN_ID: ${{ inputs.previous_run_id }}
+          RECOVERY_ARTIFACT_ID: ${{ inputs.recovery_artifact_id }}
+          NOTARY_SUBMISSION_ID: ${{ inputs.notary_submission_id }}
+          CONFIRM_SUBMISSION_SHA256: ${{ inputs.confirm_submission_sha256 }}
+      - name: Download encrypted snapshots with mandatory outer digest verification
+        run: node orchestration/verify-recovery.mjs download "$RUNNER_TEMP/verified-recovery.json" "$RUNNER_TEMP/source-recovery"
+        env:
+          GH_RECOVERY_TOKEN: ${{ github.token }}
+      - name: Resume authenticated bytes and the same Apple submission
+        run: node tools/release.mjs resume "$RUNNER_TEMP/source-recovery" "$RUNNER_TEMP/receipts"
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          RECOVERY_ENCRYPTION_KEY: ${{ secrets.RECOVERY_ENCRYPTION_KEY }}
+          CF_CANDIDATE_ACCESS_CLIENT_ID: ${{ secrets.CF_CANDIDATE_ACCESS_CLIENT_ID }}
+          CF_CANDIDATE_ACCESS_CLIENT_SECRET: ${{ secrets.CF_CANDIDATE_ACCESS_CLIENT_SECRET }}
+          STAGING_CF_CANDIDATE_ACCESS_CLIENT_ID: ${{ secrets.STAGING_CF_CANDIDATE_ACCESS_CLIENT_ID }}
+          STAGING_CF_CANDIDATE_ACCESS_CLIENT_SECRET: ${{ secrets.STAGING_CF_CANDIDATE_ACCESS_CLIENT_SECRET }}
+          NOTARY_SUBMISSION_ID: ${{ inputs.notary_submission_id }}
+          CONFIRM_SUBMISSION_SHA256: ${{ inputs.confirm_submission_sha256 }}
+      - name: Retry signing material cleanup
+        if: always() && env.ETCPRO6_RELEASE_WORK != ''
+        run: node orchestration/cleanup.mjs
+      - name: Retain the exact recovered candidate receipt
+        id: receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: approved-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/receipts/candidate.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve complete original and newly advanced encrypted snapshots
+        id: preserve
+        if: always() && (failure() || cancelled())
+        run: node orchestration/verify-recovery.mjs retain "$RUNNER_TEMP/source-recovery" "$RUNNER_TEMP/receipts" "$RUNNER_TEMP/retained-recovery"
+      - name: Retain only validated encrypted recovery pairs
+        if: always() && (failure() || cancelled()) && steps.preserve.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-notary-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/retained-recovery/submission-recovery.bin
+            ${{ runner.temp }}/retained-recovery/submission-recovery.json
+            ${{ runner.temp }}/retained-recovery/notary-recovery.bin
+            ${{ runner.temp }}/retained-recovery/notary-recovery.json
+            ${{ runner.temp }}/retained-recovery/candidate-recovery.bin
+            ${{ runner.temp }}/retained-recovery/candidate-recovery.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+  stable:
+    needs: recover-candidate
+    environment: production-stable
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download the exact recovered candidate with mandatory digest verification
+        run: node orchestration/verify-recovery.mjs download-candidate "$RUNNER_TEMP/candidate"
+        env:
+          GH_RECOVERY_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CURRENT_COMMIT: ${{ github.sha }}
+          CANDIDATE_ARTIFACT_ID: ${{ needs.recover-candidate.outputs.receipt_id }}
+      - name: Promote recovered candidate with compare-and-swap
+        run: node tools/release.mjs promote "$RUNNER_TEMP/candidate/candidate.json" "$RUNNER_TEMP/stable-receipt"
+        env:
+          UPDATE_PUBLIC_BASE_URL: ${{ vars.UPDATE_PUBLIC_BASE_URL }}
+          UPDATE_ADMIN_BASE_URL: ${{ vars.UPDATE_ADMIN_BASE_URL }}
+          CF_CHANNEL_ACCESS_CLIENT_ID: ${{ secrets.CF_CHANNEL_ACCESS_CLIENT_ID }}
+          CF_CHANNEL_ACCESS_CLIENT_SECRET: ${{ secrets.CF_CHANNEL_ACCESS_CLIENT_SECRET }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: stable-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stable-receipt/stable.json
+          if-no-files-found: ignore
+          retention-days: 30
