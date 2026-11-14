@@ -11,9 +11,14 @@ same person.
 The public workflow runs only reviewed tools from this repository's protected
 `main`. It never checks out private source in the signing job, runs a downloaded
 script, or invokes Xcode build phases. The private build produces a Universal
-unsigned `.xcarchive`; the signer uses only `xcodebuild -exportArchive`.
-Developer ID export of that archive remains a live Apple-credential acceptance
-gate until an actual signing run succeeds.
+unsigned `.xcarchive`; the signer uses `xcodebuild -exportArchive`, followed by
+explicit inside-out signing of built Mach-O code and nested bundles. Every
+signature requests Hardened Runtime and a secure timestamp. Signing never uses
+`--deep` (verification does). Original entitlements are parsed before any signing;
+debugger attachment is rejected. Other entitlements remain part of the approved
+source/archive review, rather than a complete public-tool entitlement allowlist.
+A local real Developer ID export and signature verification passed; hosted
+signing, notarization and real-client updates remain separate acceptance gates.
 
 ## Interfaces
 

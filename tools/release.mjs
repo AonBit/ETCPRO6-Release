@@ -168,7 +168,39 @@ export async function exportArchive(archive, work, m, env, execute = run) {
   // Export processes an already built archive. No build/project/workspace argument is permitted.
   execute('/usr/bin/xcodebuild', ['-exportArchive', '-archivePath', archive, '-exportPath', path.join(work, 'export'), '-exportOptionsPlist', options]);
   const app = path.join(work, 'export/ETCPRO6.app');
-  await sanitizeApp(app, execute); await validateApp(app, m, env, true, execute); return app;
+  await sanitizeApp(app, execute);
+  await signBuiltApp(app, work, env, execute, path.join(archive, 'Products/Applications/ETCPRO6.app'));
+  await validateApp(app, m, env, true, execute); return app;
+}
+export async function signBuiltApp(app, work, env, execute = run, originalApp = app) {
+  const objects = [];
+  async function visit(target) {
+    const stat = await lstat(target);
+    if (stat.isSymbolicLink()) return;
+    if (stat.isDirectory()) {
+      for (const name of (await readdir(target)).sort()) await visit(path.join(target, name));
+      if (target === app || /\.(?:app|xpc|framework)$/.test(target)) objects.push(target);
+    } else if (stat.isFile()) {
+      const bytes = await readFile(target), magic = bytes.subarray(0, 4).toString('hex');
+      if (['feedface','cefaedfe','feedfacf','cffaedfe','cafebabe','bebafeca','cafebabf','bfbafeca'].includes(magic)) objects.push(target);
+    } else fail('Unsupported signing entity');
+  }
+  await visit(app);
+  const entitlements = path.join(work, 'signing-entitlements'); await mkdir(entitlements, { mode: 0o700 });
+  // Capture original embedded entitlements before any child signature can change a parent seal.
+  const records = [];
+  for (const [index, target] of objects.entries()) {
+    const original = path.join(originalApp, path.relative(app, target));
+    const result = execute('/usr/bin/codesign', ['-d', '--entitlements', ':-', original], { allowFailure: true });
+    const args = ['--force', '--options', 'runtime', '--timestamp', '--sign', env.APPLE_SIGNING_IDENTITY];
+    if (result.stdout.trim()) {
+      let data; try { data = JSON.parse(execute('/usr/bin/plutil', ['-convert','json','-o','-','-'], { input: result.stdout }).stdout); } catch { fail('Invalid original signing entitlements'); }
+      if (!data || typeof data !== 'object' || Array.isArray(data) || data['com.apple.security.get-task-allow'] === true) fail('Debugger entitlement is forbidden');
+      const file = path.join(entitlements, `${index}.plist`); await writeFile(file, result.stdout, { mode: 0o600, flag: 'wx' }); args.push('--entitlements', file);
+    }
+    records.push({ target, args });
+  }
+  for (const { target, args } of records) execute('/usr/bin/codesign', [...args, target]);
 }
 async function makeDMG(app, work, m, env, execute = run) {
   const payload = path.join(work, 'payload'); await mkdir(payload, { mode: 0o700 });
