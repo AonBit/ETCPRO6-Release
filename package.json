@@ -1,0 +1,8 @@
+{
+  "name": "etcpro6-release",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/*.test.mjs orchestration/*.test.mjs", "check": "node --check tools/archive.mjs && node --check tools/release.mjs" }
+}

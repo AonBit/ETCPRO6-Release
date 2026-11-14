@@ -1,0 +1,155 @@
+name: Approved cloud release
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full private main commit SHA
+        type: string
+        required: true
+      source_run_id:
+        description: Successful private unsigned workflow run ID
+        type: string
+        required: true
+      source_artifact_id:
+        description: Exact private unsigned artifact ID
+        type: string
+        required: true
+      release_tag:
+        description: Private source tag (vX.Y.Z)
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+jobs:
+  gate:
+    if: github.repository == 'AonBit/ETCPRO6-Release' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require completed repository bootstrap
+        env:
+          ENABLED: ${{ vars.CLOUD_RELEASE_ENABLED }}
+        run: test "$ENABLED" = true
+  candidate:
+    needs: gate
+    environment: production-candidate
+    runs-on: xcode-27
+    timeout-minutes: 60
+    outputs:
+      receipt_id: ${{ steps.receipt.outputs.artifact-id }}
+    env:
+      UPDATE_PUBLIC_BASE_URL: ${{ vars.UPDATE_PUBLIC_BASE_URL }}
+      UPDATE_ADMIN_BASE_URL: ${{ vars.UPDATE_ADMIN_BASE_URL }}
+      STAGING_UPDATE_PUBLIC_BASE_URL: ${{ vars.STAGING_UPDATE_PUBLIC_BASE_URL }}
+      STAGING_UPDATE_ADMIN_BASE_URL: ${{ vars.STAGING_UPDATE_ADMIN_BASE_URL }}
+      ETCPRO6_UPDATE_PUBLIC_KEY: ${{ vars.ETCPRO6_UPDATE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: sudo xcode-select --switch /Applications/Xcode_27.2.app/Contents/Developer
+      - name: Create read-only private source token
+        id: source
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          client-id: ${{ vars.SOURCE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SOURCE_APP_PRIVATE_KEY }}
+          owner: AonBit
+          repositories: ETCPRO6-MAC
+          permission-contents: read
+          permission-actions: read
+      - name: Bind exact private run and artifact
+        run: node orchestration/verify-source.mjs "$RUNNER_TEMP/verified-request.json"
+        env:
+          GH_SOURCE_TOKEN: ${{ steps.source.outputs.token }}
+          SOURCE_REPOSITORY: AonBit/ETCPRO6-MAC
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+      - name: Download and verify exact private artifact bytes
+        run: node orchestration/download-source.mjs "$RUNNER_TEMP/verified-request.json" "$RUNNER_TEMP/private-input"
+        env:
+          GH_SOURCE_TOKEN: ${{ steps.source.outputs.token }}
+      - name: Revoke source token before signing
+        if: always() && steps.source.outputs.token != ''
+        run: node orchestration/revoke-source.mjs
+        env:
+          GH_SOURCE_TOKEN: ${{ steps.source.outputs.token }}
+      - name: Inspect unsigned input before exposing signing credentials
+        run: node --input-type=module -e 'import { inspectInput } from "./tools/release.mjs"; await inspectInput(`${process.env.RUNNER_TEMP}/private-input`, `${process.env.RUNNER_TEMP}/verified-request.json`, process.env);'
+      - name: Sign notarize and finalize candidate
+        run: node tools/release.mjs candidate "$RUNNER_TEMP/private-input" "$RUNNER_TEMP/verified-request.json" "$RUNNER_TEMP/receipts"
+        env:
+          APPLE_SIGNING_P12: ${{ secrets.APPLE_SIGNING_P12 }}
+          APPLE_SIGNING_P12_PASSWORD: ${{ secrets.APPLE_SIGNING_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          RECOVERY_ENCRYPTION_KEY: ${{ secrets.RECOVERY_ENCRYPTION_KEY }}
+          CF_CANDIDATE_ACCESS_CLIENT_ID: ${{ secrets.CF_CANDIDATE_ACCESS_CLIENT_ID }}
+          CF_CANDIDATE_ACCESS_CLIENT_SECRET: ${{ secrets.CF_CANDIDATE_ACCESS_CLIENT_SECRET }}
+          STAGING_CF_CANDIDATE_ACCESS_CLIENT_ID: ${{ secrets.STAGING_CF_CANDIDATE_ACCESS_CLIENT_ID }}
+          STAGING_CF_CANDIDATE_ACCESS_CLIENT_SECRET: ${{ secrets.STAGING_CF_CANDIDATE_ACCESS_CLIENT_SECRET }}
+      - name: Retry signing cleanup
+        if: always() && env.ETCPRO6_RELEASE_WORK != ''
+        run: node orchestration/cleanup.mjs
+      - name: Retain sanitized approved candidate only
+        id: receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: approved-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/receipts/candidate.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain only encrypted notary recovery on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-notary-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/receipts/submission-recovery.bin
+            ${{ runner.temp }}/receipts/submission-recovery.json
+            ${{ runner.temp }}/receipts/notary-recovery.bin
+            ${{ runner.temp }}/receipts/notary-recovery.json
+            ${{ runner.temp }}/receipts/candidate-recovery.bin
+            ${{ runner.temp }}/receipts/candidate-recovery.json
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 7
+  stable:
+    needs: candidate
+    environment: production-stable
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          artifact-ids: ${{ needs.candidate.outputs.receipt_id }}
+          path: ${{ runner.temp }}/candidate
+          merge-multiple: true
+      - name: Promote exact approved candidate with compare-and-swap
+        run: node tools/release.mjs promote "$RUNNER_TEMP/candidate/candidate.json" "$RUNNER_TEMP/stable-receipt"
+        env:
+          UPDATE_PUBLIC_BASE_URL: ${{ vars.UPDATE_PUBLIC_BASE_URL }}
+          UPDATE_ADMIN_BASE_URL: ${{ vars.UPDATE_ADMIN_BASE_URL }}
+          CF_CHANNEL_ACCESS_CLIENT_ID: ${{ secrets.CF_CHANNEL_ACCESS_CLIENT_ID }}
+          CF_CHANNEL_ACCESS_CLIENT_SECRET: ${{ secrets.CF_CHANNEL_ACCESS_CLIENT_SECRET }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: stable-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stable-receipt/stable.json
+          if-no-files-found: ignore
+          retention-days: 30

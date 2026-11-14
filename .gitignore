@@ -1,0 +1,9 @@
+.DS_Store
+node_modules/
+*.p12
+*.p8
+*.key
+*.dmg
+*.zip
+receipts/
+private-input/
